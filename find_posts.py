@@ -14,8 +14,13 @@ import time
 import argparse
 import uuid
 import defusedxml.ElementTree as ET
+import urllib.robotparser
+from urllib.parse import urlparse
 
 logger = logging.getLogger("FediFetcher")
+robotParser = urllib.robotparser.RobotFileParser()
+
+VERSION = "7.1.0"
 
 argparser=argparse.ArgumentParser()
 
@@ -459,6 +464,30 @@ def get_reply_toots(user_id, server, access_token, seen_urls, reply_since):
         f"Error getting replies for user {user_id} on server {server}. Status code: {resp.status_code}"
     )
 
+def toot_context_should_be_fetched(toot):
+    if toot['uri'] not in recently_checked_context:
+        recently_checked_context[toot['uri']] = toot
+        return True
+    else:
+        lastSeen = recently_checked_context[toot['uri']]['lastSeen']
+        createdAt = recently_checked_context[toot['uri']]['created_at']
+
+        # convert to date time, if needed
+        if isinstance(createdAt, str):
+            createdAt = parser.parse(createdAt)
+
+        lastSeenInSeconds = (datetime.now(lastSeen.tzinfo) - lastSeen).total_seconds()
+        ageInSeconds = (datetime.now(createdAt.tzinfo) - createdAt).total_seconds()
+        if(ageInSeconds <= 60 * 60 and lastSeenInSeconds >= 60):
+            # For the first hour: allow refetching once per minute
+            return True
+        if(ageInSeconds <= 24 * 60 * 60 and lastSeenInSeconds >= 10 * 60):
+            # For the rest of the first day: once every 10 minutes
+            return True
+        if(lastSeenInSeconds >= 60 * 60):
+            # After that: hourly
+            return True
+    return False    
 
 def get_all_known_context_urls(server, reply_toots, parsed_urls, seen_hosts):
     """get the context toots of the given toots from their original server"""
@@ -468,12 +497,14 @@ def get_all_known_context_urls(server, reply_toots, parsed_urls, seen_hosts):
         if toot_has_parseable_url(toot, parsed_urls):
             url = toot["url"] if toot["reblog"] is None else toot["reblog"]["url"]
             parsed_url = parse_url(url, parsed_urls)
-            context = get_toot_context(parsed_url[0], parsed_url[1], url, seen_hosts)
-            if context is not None:
-                for item in context:
-                    known_context_urls.add(item)
-            else:
-                logger.error(f"Error getting context for toot {url}")
+            if(toot_context_should_be_fetched(toot)):
+                recently_checked_context[toot['uri']]['lastSeen'] = datetime.now(datetime.now().astimezone().tzinfo)
+                context = get_toot_context(parsed_url[0], parsed_url[1], url, seen_hosts)
+                if context is not None:
+                    for item in context:
+                        known_context_urls.add(item)
+                else:
+                    logger.error(f"Error getting context for toot {url}")
     
     known_context_urls = set(filter(lambda url: not url.startswith(f"https://{server}/"), known_context_urls))
     logger.info(f"Found {len(known_context_urls)} known context toots")
@@ -707,13 +738,22 @@ def get_redirect_url(url):
 
 def get_all_context_urls(server, replied_toot_ids, seen_hosts):
     """get the URLs of the context toots of the given toots"""
-    return filter(
-        lambda url: not url.startswith(f"https://{server}/"),
-        itertools.chain.from_iterable(
-            get_toot_context(server, toot_id, url, seen_hosts)
-            for (url, (server, toot_id)) in replied_toot_ids
-        ),
-    )
+    known_context_urls = set()
+    for (url, (server, toot_id)) in replied_toot_ids:
+        if(toot_context_should_be_fetched(toot)):
+            recently_checked_context[toot['uri']]['lastSeen'] = datetime.now(datetime.now().astimezone().tzinfo)
+            context = get_toot_context(server, toot_id, url, seen_hosts)
+            if context is not None:
+                for item in context:
+                    known_context_urls.add(item)
+            else:
+                logger.error(f"Error getting context for toot {url}")
+
+    known_context_urls = set(filter(lambda url: not url.startswith(f"https://{server}/"), known_context_urls))
+    
+    logger.info(f"Found {len(known_context_urls)} known context toots")
+    
+    return known_context_urls
 
 
 def get_toot_context(server, toot_id, toot_url, seen_hosts):
@@ -965,12 +1005,25 @@ def get_paginated_mastodon(url, max, headers = {}, timeout = 0, max_tries = 5):
                 break
     return result
 
+def can_fetch(user_agent, url):
+    parsed_uri = urlparse(url)
+    robots = '{uri.scheme}://{uri.netloc}/robots.txt'.format(uri=parsed_uri)
+    robotParser = urllib.robotparser.RobotFileParser()
+    robotParser.set_url(robots)
+    robotParser.read()
+    return robotParser.can_fetch(user_agent, url)
 
-def get(url, headers = {}, timeout = 0, max_tries = 5):
+def user_agent():
+    return f"FediFetcher/{VERSION}; +{arguments.server} (https://go.thms.uk/ff)"
+
+def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False):
     """A simple wrapper to make a get request while providing our user agent, and respecting rate limits"""
     h = headers.copy()
     if 'User-Agent' not in h:
-        h['User-Agent'] = f"FediFetcher (+{arguments.server}; https://go.thms.uk/ff)"
+        h['User-Agent'] = user_agent()
+
+    if not ignore_robots_txt and not can_fetch(h['User-Agent'], url):
+        raise Exception(f"Querying {url} prohibited by robots.txt")    
 
     if timeout == 0:
         timeout = arguments.http_timeout
@@ -992,8 +1045,11 @@ def post(url, json, headers = {}, timeout = 0, max_tries = 5):
     """A simple wrapper to make a post request while providing our user agent, and respecting rate limits"""
     h = headers.copy()
     if 'User-Agent' not in h:
-        h['User-Agent'] = 'FediFetcher (https://go.thms.uk/mgr)'
+        h['User-Agent'] = user_agent()
 
+    if not can_fetch(h['User-Agent'], url):
+        raise Exception(f"Querying {url} prohibited by robots.txt")    
+    
     if timeout == 0:
         timeout = arguments.http_timeout
 
@@ -1278,7 +1334,7 @@ if __name__ == "__main__":
 
     if(arguments.on_start != None and arguments.on_start != ''):
         try:
-            get(f"{arguments.on_start}?rid={runId}")
+            get(f"{arguments.on_start}?rid={runId}", ignore_robots_txt = True)
         except Exception as ex:
             logger.error(f"Error getting callback url: {ex}")
 
@@ -1300,7 +1356,7 @@ if __name__ == "__main__":
                 logger.critical(f"Lock file age is {datetime.now() - lock_time} - below --lock-hours={arguments.lock_hours} provided.")
                 if(arguments.on_fail != None and arguments.on_fail != ''):
                     try:
-                        get(f"{arguments.on_fail}?rid={runId}")
+                        get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
                     except Exception as ex:
                         logger.error(f"Error getting callback url: {ex}")
                 sys.exit(1)
@@ -1309,7 +1365,7 @@ if __name__ == "__main__":
             logger.critical(f"Cannot read logfile age - aborting.")
             if(arguments.on_fail != None and arguments.on_fail != ''):
                 try:
-                    get(f"{arguments.on_fail}?rid={runId}")
+                    get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
                 except Exception as ex:
                     logger.error(f"Error getting callback url: {ex}")
             sys.exit(1)
@@ -1324,6 +1380,7 @@ if __name__ == "__main__":
         KNOWN_FOLLOWINGS_FILE = os.path.join(arguments.state_dir, "known_followings")
         RECENTLY_CHECKED_USERS_FILE = os.path.join(arguments.state_dir, "recently_checked_users")
         SEEN_HOSTS_FILE = os.path.join(arguments.state_dir, "seen_hosts")
+        RECENTLY_CHECKED_CONTEXTS_FILE = os.path.join(arguments.state_dir, 'recent_context')
 
 
         seen_urls = OrderedSet([])
@@ -1352,6 +1409,21 @@ if __name__ == "__main__":
             userAge = datetime.now(lastCheck.tzinfo) - lastCheck
             if(userAge.total_seconds() > arguments.remember_users_for_hours * 60 * 60):
                 recently_checked_users.pop(user)    
+
+        recently_checked_context = {}
+        if(os.path.exists(RECENTLY_CHECKED_CONTEXTS_FILE)):
+            with open(RECENTLY_CHECKED_CONTEXTS_FILE, "r", encoding="utf-8") as f:
+                recently_checked_context = json.load(f)
+
+        # Remove any toots that we haven't seen in a while, to ensure this doesn't grow indefinitely
+        for tootUrl in recently_checked_context:
+            recently_checked_context[tootUrl]['lastSeen'] = parser.parse(recently_checked_context[tootUrl]['lastSeen'])
+            recently_checked_context[tootUrl]['created_at'] = parser.parse(recently_checked_context[tootUrl]['created_at'])
+            lastSeen = recently_checked_context[tootUrl]['lastSeen']
+            userAge = datetime.now(lastSeen.tzinfo) - lastSeen
+            # dont really need to keep track for more than 7 days: if we haven't seen it in 7 days we can refetch content anyway
+            if(userAge.total_seconds() > 7 * 24 * 60 * 60):
+                recently_checked_users.pop(tootUrl)    
 
         parsed_urls = {}
 
@@ -1470,11 +1542,14 @@ if __name__ == "__main__":
         with open(SEEN_HOSTS_FILE, "w", encoding="utf-8") as f:
             f.write(seen_hosts.toJSON())
 
+        with open(RECENTLY_CHECKED_CONTEXTS_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(recently_checked_context, default=str))
+
         os.remove(LOCK_FILE)
 
         if(arguments.on_done != None and arguments.on_done != ''):
             try:
-                get(f"{arguments.on_done}?rid={runId}")
+                get(f"{arguments.on_done}?rid={runId}", ignore_robots_txt = True)
             except Exception as ex:
                 logger.error(f"Error getting callback url: {ex}")
 
@@ -1485,7 +1560,7 @@ if __name__ == "__main__":
         logger.error(f"Job failed after {datetime.now() - start}.")
         if(arguments.on_fail != None and arguments.on_fail != ''):
             try:
-                get(f"{arguments.on_fail}?rid={runId}")
+                get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
             except Exception as ex:
                 logger.error(f"Error getting callback url: {ex}")
         raise
