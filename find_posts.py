@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger("FediFetcher")
 robotParser = urllib.robotparser.RobotFileParser()
 
-VERSION = "7.1.0"
+VERSION = "7.1.1"
 
 argparser=argparse.ArgumentParser()
 
@@ -1008,10 +1008,31 @@ def get_paginated_mastodon(url, max, headers = {}, timeout = 0, max_tries = 5):
 def can_fetch(user_agent, url):
     parsed_uri = urlparse(url)
     robots = '{uri.scheme}://{uri.netloc}/robots.txt'.format(uri=parsed_uri)
+
+    if robots in ROBOTS_TXT:
+        if isinstance(ROBOTS_TXT[robots], bool):
+            return ROBOTS_TXT[robots]
+        else:
+            robotsTxt = ROBOTS_TXT[robots]
+    else:
+        try:
+            # We are getting the robots.txt manually from here, because otherwise we can't change the User Agent
+            robotsTxt = get(robots, timeout = 2, ignore_robots_txt=True)
+            if robotsTxt.status_code in (401, 403):
+                ROBOTS_TXT[robots] = False
+                return False
+            elif robotsTxt.status_code != 200:
+                ROBOTS_TXT[robots] = True
+                return True
+            robotsTxt = robotsTxt.text
+            ROBOTS_TXT[robots] = robotsTxt
+        except Exception as ex:
+            return True
+    
     robotParser = urllib.robotparser.RobotFileParser()
-    robotParser.set_url(robots)
-    robotParser.read()
+    robotParser.parse(robotsTxt.splitlines())
     return robotParser.can_fetch(user_agent, url)
+
 
 def user_agent():
     return f"FediFetcher/{VERSION}; +{arguments.server} (https://go.thms.uk/ff)"
@@ -1382,6 +1403,7 @@ if __name__ == "__main__":
         SEEN_HOSTS_FILE = os.path.join(arguments.state_dir, "seen_hosts")
         RECENTLY_CHECKED_CONTEXTS_FILE = os.path.join(arguments.state_dir, 'recent_context')
 
+        ROBOTS_TXT = {}
 
         seen_urls = OrderedSet([])
         if os.path.exists(SEEN_URLS_FILE):
