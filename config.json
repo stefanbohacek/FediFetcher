@@ -6,5 +6,5 @@
   "max-followers": 80,
   "max-follow-requests": 80,
   "max-bookmarks": 80,
-  "from-notifications": 1
+  "from-notifications": 0
 }
