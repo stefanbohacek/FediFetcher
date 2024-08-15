@@ -1,9 +1,10 @@
 {
   "server": "stefanbohacek.online",
-  "home-timeline-length": 100,
+  "home-timeline-length": 20,
+  "backfill-with-context": 0,
   "max-followings": 80,
   "max-followers": 80,
   "max-follow-requests": 80,
   "max-bookmarks": 80,
-  "from-notifications": 0
+  "from-notifications": 1
 }
